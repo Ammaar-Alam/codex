@@ -21,9 +21,9 @@ from typing import Any, Literal
 SCHEMA_VERSION = "2025-06-18"
 JSONRPC_VERSION = "2.0"
 
-STANDARD_DERIVE = "#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, TS)]\n"
+STANDARD_DERIVE = "#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]\n"
 STANDARD_HASHABLE_DERIVE = (
-    "#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Hash, Eq, TS)]\n"
+    "#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Hash, Eq, JsonSchema, TS)]\n"
 )
 
 # Will be populated with the schema's `definitions` map in `main()` so that
@@ -37,6 +37,13 @@ SERVER_NOTIFICATION_TYPE_NAMES: list[str] = []
 # Enum types that will need a `allow(clippy::large_enum_variant)` annotation in
 # order to compile without warnings.
 LARGE_ENUMS = {"ServerResult"}
+
+# some types need setting a default value for `r#type`
+# ref: [#7417](https://github.com/openai/codex/pull/7417)
+default_type_values: dict[str, str] = {
+    "ToolInputSchema": "object",
+    "ToolOutputSchema": "object",
+}
 
 
 def main() -> int:
@@ -94,6 +101,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::convert::TryFrom;
 
+use schemars::JsonSchema;
 use ts_rs::TS;
 
 pub const MCP_SCHEMA_VERSION: &str = "{SCHEMA_VERSION}";
@@ -331,6 +339,7 @@ class StructField:
     name: str
     type_name: str
     serde: str | None = None
+    ts: str | None = None
     comment: str | None = None
 
     def append(self, out: list[str], supports_const: bool) -> None:
@@ -338,6 +347,8 @@ class StructField:
             out.append(f"    // {self.comment}\n")
         if self.serde:
             out.append(f"    {self.serde}\n")
+        if self.ts:
+            out.append(f"    {self.ts}\n")
         if self.viz == "const":
             if supports_const:
                 out.append(f"    const {self.name}: {self.type_name};\n")
@@ -347,6 +358,14 @@ class StructField:
             out.append(f"    pub {self.name}: {self.type_name},\n")
 
 
+def append_serde_attr(existing: str | None, fragment: str) -> str:
+    if existing is None:
+        return f"#[serde({fragment})]"
+    assert existing.startswith("#[serde(") and existing.endswith(")]"), existing
+    body = existing[len("#[serde(") : -2]
+    return f"#[serde({body}, {fragment})]"
+
+
 def define_struct(
     name: str,
     properties: dict[str, Any],
@@ -354,6 +373,14 @@ def define_struct(
     description: str | None,
 ) -> list[str]:
     out: list[str] = []
+
+    type_default_fn: str | None = None
+    if name in default_type_values:
+        snake_name = to_snake_case(name) or name
+        type_default_fn = f"{snake_name}_type_default_str"
+        out.append(f"fn {type_default_fn}() -> String {{\n")
+        out.append(f'    "{default_type_values[name]}".to_string()\n')
+        out.append("}\n\n")
 
     fields: list[StructField] = []
     for prop_name, prop in properties.items():
@@ -376,10 +403,14 @@ def define_struct(
         if is_optional:
             prop_type = f"Option<{prop_type}>"
         rs_prop = rust_prop_name(prop_name, is_optional)
+
+        if prop_name == "type" and type_default_fn:
+            rs_prop.serde = append_serde_attr(rs_prop.serde, f'default = "{type_default_fn}"')
+
         if prop_type.startswith("&'static str"):
-            fields.append(StructField("const", rs_prop.name, prop_type, rs_prop.serde))
+            fields.append(StructField("const", rs_prop.name, prop_type, rs_prop.serde, rs_prop.ts))
         else:
-            fields.append(StructField("pub", rs_prop.name, prop_type, rs_prop.serde))
+            fields.append(StructField("pub", rs_prop.name, prop_type, rs_prop.serde, rs_prop.ts))
 
     # Special-case: add Codex-specific user_agent to Implementation
     if name == "Implementation":
@@ -389,6 +420,7 @@ def define_struct(
                 "user_agent",
                 "Option<String>",
                 '#[serde(default, skip_serializing_if = "Option::is_none")]',
+                '#[ts(optional)]',
                 "This is an extra field that the Codex MCP server sends as part of InitializeResult.",
             )
         )
@@ -473,7 +505,6 @@ def define_string_enum(
         out.append(f"    {capitalize(value)},\n")
 
     out.append("}\n\n")
-    return out
 
 
 def define_untagged_enum(name: str, type_list: list[str], out: list[str]) -> None:
@@ -589,7 +620,7 @@ def get_serde_annotation_for_anyof_type(type_name: str) -> str | None:
 
 
 def map_type(
-    typedef: dict[str, any],
+    typedef: dict[str, Any],
     prop_name: str | None = None,
     struct_name: str | None = None,
 ) -> str:
@@ -664,7 +695,8 @@ class RustProp:
     name: str
     # serde annotation, if necessary
     serde: str | None = None
-
+    # ts annotation, if necessary
+    ts: str | None = None
 
 def rust_prop_name(name: str, is_optional: bool) -> RustProp:
     """Convert a JSON property name to a Rust property name."""
@@ -683,6 +715,7 @@ def rust_prop_name(name: str, is_optional: bool) -> RustProp:
         prop_name = name
 
     serde_annotations = []
+    ts_str = None
     if is_rename:
         serde_annotations.append(f'rename = "{name}"')
     if is_optional:
@@ -690,13 +723,18 @@ def rust_prop_name(name: str, is_optional: bool) -> RustProp:
         serde_annotations.append('skip_serializing_if = "Option::is_none"')
 
     if serde_annotations:
+        # Also mark optional fields for ts-rs generation.
         serde_str = f"#[serde({', '.join(serde_annotations)})]"
     else:
         serde_str = None
-    return RustProp(prop_name, serde_str)
+
+    if is_optional and serde_str:
+        ts_str = "#[ts(optional)]"
+
+    return RustProp(prop_name, serde_str, ts_str)
 
 
-def to_snake_case(name: str) -> str:
+def to_snake_case(name: str) -> str | None:
     """Convert a camelCase or PascalCase name to snake_case."""
     snake_case = name[0].lower() + "".join("_" + c.lower() if c.isupper() else c for c in name[1:])
     if snake_case != name:

@@ -1,9 +1,8 @@
 #![cfg(target_os = "linux")]
-use codex_core::config_types::ShellEnvironmentPolicy;
+use codex_core::config::types::ShellEnvironmentPolicy;
 use codex_core::error::CodexErr;
 use codex_core::error::SandboxErr;
 use codex_core::exec::ExecParams;
-use codex_core::exec::SandboxType;
 use codex_core::exec::process_exec_tool_call;
 use codex_core::exec_env::create_env;
 use codex_core::protocol::SandboxPolicy;
@@ -35,13 +34,16 @@ fn create_env_from_core_vars() -> HashMap<String, String> {
 
 #[expect(clippy::print_stdout, clippy::expect_used, clippy::unwrap_used)]
 async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
+    let cwd = std::env::current_dir().expect("cwd should exist");
+    let sandbox_cwd = cwd.clone();
     let params = ExecParams {
-        command: cmd.iter().map(|elm| elm.to_string()).collect(),
-        cwd: std::env::current_dir().expect("cwd should exist"),
-        timeout_ms: Some(timeout_ms),
+        command: cmd.iter().copied().map(str::to_owned).collect(),
+        cwd,
+        expiration: timeout_ms.into(),
         env: create_env_from_core_vars(),
         with_escalated_permissions: None,
         justification: None,
+        arg0: None,
     };
 
     let sandbox_policy = SandboxPolicy::WorkspaceWrite {
@@ -57,8 +59,8 @@ async fn run_cmd(cmd: &[&str], writable_roots: &[PathBuf], timeout_ms: u64) {
     let codex_linux_sandbox_exe = Some(PathBuf::from(sandbox_program));
     let res = process_exec_tool_call(
         params,
-        SandboxType::LinuxSeccomp,
         &sandbox_policy,
+        sandbox_cwd.as_path(),
         &codex_linux_sandbox_exe,
         None,
     )
@@ -121,7 +123,7 @@ async fn test_writable_root() {
 }
 
 #[tokio::test]
-#[should_panic(expected = "Sandbox(Timeout)")]
+#[should_panic(expected = "Sandbox(Timeout")]
 async fn test_timeout() {
     run_cmd(&["sleep", "2"], &[], 50).await;
 }
@@ -133,15 +135,17 @@ async fn test_timeout() {
 #[expect(clippy::expect_used)]
 async fn assert_network_blocked(cmd: &[&str]) {
     let cwd = std::env::current_dir().expect("cwd should exist");
+    let sandbox_cwd = cwd.clone();
     let params = ExecParams {
-        command: cmd.iter().map(|s| s.to_string()).collect(),
+        command: cmd.iter().copied().map(str::to_owned).collect(),
         cwd,
         // Give the tool a generous 2-second timeout so even slow DNS timeouts
         // do not stall the suite.
-        timeout_ms: Some(NETWORK_TIMEOUT_MS),
+        expiration: NETWORK_TIMEOUT_MS.into(),
         env: create_env_from_core_vars(),
         with_escalated_permissions: None,
         justification: None,
+        arg0: None,
     };
 
     let sandbox_policy = SandboxPolicy::new_read_only_policy();
@@ -149,33 +153,34 @@ async fn assert_network_blocked(cmd: &[&str]) {
     let codex_linux_sandbox_exe: Option<PathBuf> = Some(PathBuf::from(sandbox_program));
     let result = process_exec_tool_call(
         params,
-        SandboxType::LinuxSeccomp,
         &sandbox_policy,
+        sandbox_cwd.as_path(),
         &codex_linux_sandbox_exe,
         None,
     )
     .await;
 
-    let (exit_code, stdout, stderr) = match result {
-        Ok(output) => (output.exit_code, output.stdout.text, output.stderr.text),
-        Err(CodexErr::Sandbox(SandboxErr::Denied(exit_code, stdout, stderr))) => {
-            (exit_code, stdout, stderr)
-        }
+    let output = match result {
+        Ok(output) => output,
+        Err(CodexErr::Sandbox(SandboxErr::Denied { output })) => *output,
         _ => {
             panic!("expected sandbox denied error, got: {result:?}");
         }
     };
 
-    dbg!(&stderr);
-    dbg!(&stdout);
-    dbg!(&exit_code);
+    dbg!(&output.stderr.text);
+    dbg!(&output.stdout.text);
+    dbg!(&output.exit_code);
 
     // A completely missing binary exits with 127.  Anything else should also
     // be non‑zero (EPERM from seccomp will usually bubble up as 1, 2, 13…)
     // If—*and only if*—the command exits 0 we consider the sandbox breached.
 
-    if exit_code == 0 {
-        panic!("Network sandbox FAILED - {cmd:?} exited 0\nstdout:\n{stdout}\nstderr:\n{stderr}",);
+    if output.exit_code == 0 {
+        panic!(
+            "Network sandbox FAILED - {cmd:?} exited 0\nstdout:\n{}\nstderr:\n{}",
+            output.stdout.text, output.stderr.text
+        );
     }
 }
 

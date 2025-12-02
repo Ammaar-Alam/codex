@@ -1,4 +1,5 @@
 use clap::Parser;
+use clap::ValueHint;
 use codex_common::ApprovalModeCliArg;
 use codex_common::CliConfigOverrides;
 use std::path::PathBuf;
@@ -7,51 +8,43 @@ use std::path::PathBuf;
 #[command(version)]
 pub struct Cli {
     /// Optional user prompt to start the session.
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
 
     /// Optional image(s) to attach to the initial prompt.
     #[arg(long = "image", short = 'i', value_name = "FILE", value_delimiter = ',', num_args = 1..)]
     pub images: Vec<PathBuf>,
 
-    /// Open an interactive picker to resume a previous session recorded on disk
-    /// instead of starting a new one.
-    ///
-    /// Notes:
-    /// - Mutually exclusive with `--continue`.
-    /// - The picker displays recent sessions and a preview of the first real user
-    ///   message to help you select the right one.
-    #[arg(
-        long = "resume",
-        default_value_t = false,
-        conflicts_with = "continue",
-        hide = true
-    )]
-    pub resume: bool,
+    // Internal controls set by the top-level `codex resume` subcommand.
+    // These are not exposed as user flags on the base `codex` command.
+    #[clap(skip)]
+    pub resume_picker: bool,
 
-    /// Continue the most recent conversation without showing the picker.
-    ///
-    /// Notes:
-    /// - Mutually exclusive with `--resume`.
-    /// - If no recorded sessions are found, this behaves like starting fresh.
-    /// - Equivalent to picking the newest item in the resume picker.
-    #[arg(
-        id = "continue",
-        long = "continue",
-        default_value_t = false,
-        conflicts_with = "resume",
-        hide = true
-    )]
-    pub r#continue: bool,
+    #[clap(skip)]
+    pub resume_last: bool,
+
+    /// Internal: resume a specific recorded session by id (UUID). Set by the
+    /// top-level `codex resume <SESSION_ID>` wrapper; not exposed as a public flag.
+    #[clap(skip)]
+    pub resume_session_id: Option<String>,
+
+    /// Internal: show all sessions (disables cwd filtering and shows CWD column).
+    #[clap(skip)]
+    pub resume_show_all: bool,
 
     /// Model the agent should use.
     #[arg(long, short = 'm')]
     pub model: Option<String>,
 
-    /// Convenience flag to select the local open source model provider.
-    /// Equivalent to -c model_provider=oss; verifies a local Ollama server is
-    /// running.
+    /// Convenience flag to select the local open source model provider. Equivalent to -c
+    /// model_provider=oss; verifies a local LM Studio or Ollama server is running.
     #[arg(long = "oss", default_value_t = false)]
     pub oss: bool,
+
+    /// Specify which local provider to use (lmstudio or ollama).
+    /// If not specified with --oss, will use config default or show selection.
+    #[arg(long = "local-provider")]
+    pub oss_provider: Option<String>,
 
     /// Configuration profile from config.toml to specify default options.
     #[arg(long = "profile", short = 'p')]
@@ -66,7 +59,7 @@ pub struct Cli {
     #[arg(long = "ask-for-approval", short = 'a')]
     pub approval_policy: Option<ApprovalModeCliArg>,
 
-    /// Convenience alias for low-friction sandboxed automatic execution (-a on-failure, --sandbox workspace-write).
+    /// Convenience alias for low-friction sandboxed automatic execution (-a on-request, --sandbox workspace-write).
     #[arg(long = "full-auto", default_value_t = false)]
     pub full_auto: bool,
 
@@ -87,6 +80,10 @@ pub struct Cli {
     /// Enable web search (off by default). When enabled, the native Responses `web_search` tool is available to the model (no per‑call approval).
     #[arg(long = "search", default_value_t = false)]
     pub web_search: bool,
+
+    /// Additional directories that should be writable alongside the primary workspace.
+    #[arg(long = "add-dir", value_name = "DIR", value_hint = ValueHint::DirPath)]
+    pub add_dir: Vec<PathBuf>,
 
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,

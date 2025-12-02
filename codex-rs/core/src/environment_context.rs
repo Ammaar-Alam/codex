@@ -2,9 +2,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use strum_macros::Display as DeriveDisplay;
 
+use crate::codex::TurnContext;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
 use crate::shell::Shell;
+use crate::shell::default_user_shell;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -27,7 +29,7 @@ pub(crate) struct EnvironmentContext {
     pub sandbox_mode: Option<SandboxMode>,
     pub network_access: Option<NetworkAccess>,
     pub writable_roots: Option<Vec<PathBuf>>,
-    pub shell: Option<Shell>,
+    pub shell: Shell,
 }
 
 impl EnvironmentContext {
@@ -35,7 +37,7 @@ impl EnvironmentContext {
         cwd: Option<PathBuf>,
         approval_policy: Option<AskForApproval>,
         sandbox_policy: Option<SandboxPolicy>,
-        shell: Option<Shell>,
+        shell: Shell,
     ) -> Self {
         Self {
             cwd,
@@ -70,6 +72,58 @@ impl EnvironmentContext {
             },
             shell,
         }
+    }
+
+    /// Compares two environment contexts, ignoring the shell. Useful when
+    /// comparing turn to turn, since the initial environment_context will
+    /// include the shell, and then it is not configurable from turn to turn.
+    pub fn equals_except_shell(&self, other: &EnvironmentContext) -> bool {
+        let EnvironmentContext {
+            cwd,
+            approval_policy,
+            sandbox_mode,
+            network_access,
+            writable_roots,
+            // should compare all fields except shell
+            shell: _,
+        } = other;
+
+        self.cwd == *cwd
+            && self.approval_policy == *approval_policy
+            && self.sandbox_mode == *sandbox_mode
+            && self.network_access == *network_access
+            && self.writable_roots == *writable_roots
+    }
+
+    pub fn diff(before: &TurnContext, after: &TurnContext) -> Self {
+        let cwd = if before.cwd != after.cwd {
+            Some(after.cwd.clone())
+        } else {
+            None
+        };
+        let approval_policy = if before.approval_policy != after.approval_policy {
+            Some(after.approval_policy)
+        } else {
+            None
+        };
+        let sandbox_policy = if before.sandbox_policy != after.sandbox_policy {
+            Some(after.sandbox_policy.clone())
+        } else {
+            None
+        };
+        EnvironmentContext::new(cwd, approval_policy, sandbox_policy, default_user_shell())
+    }
+}
+
+impl From<&TurnContext> for EnvironmentContext {
+    fn from(turn_context: &TurnContext) -> Self {
+        Self::new(
+            Some(turn_context.cwd.clone()),
+            Some(turn_context.approval_policy),
+            Some(turn_context.sandbox_policy.clone()),
+            // Shell is not configurable from turn to turn
+            default_user_shell(),
+        )
     }
 }
 
@@ -116,11 +170,9 @@ impl EnvironmentContext {
             }
             lines.push("  </writable_roots>".to_string());
         }
-        if let Some(shell) = self.shell
-            && let Some(shell_name) = shell.name()
-        {
-            lines.push(format!("  <shell>{shell_name}</shell>"));
-        }
+
+        let shell_name = self.shell.name();
+        lines.push(format!("  <shell>{shell_name}</shell>"));
         lines.push(ENVIRONMENT_CONTEXT_CLOSE_TAG.to_string());
         lines.join("\n")
     }
@@ -140,8 +192,17 @@ impl From<EnvironmentContext> for ResponseItem {
 
 #[cfg(test)]
 mod tests {
+    use crate::shell::ShellType;
+
     use super::*;
     use pretty_assertions::assert_eq;
+
+    fn fake_shell() -> Shell {
+        Shell {
+            shell_type: ShellType::Bash,
+            shell_path: PathBuf::from("/bin/bash"),
+        }
+    }
 
     fn workspace_write_policy(writable_roots: Vec<&str>, network_access: bool) -> SandboxPolicy {
         SandboxPolicy::WorkspaceWrite {
@@ -158,7 +219,7 @@ mod tests {
             Some(PathBuf::from("/repo")),
             Some(AskForApproval::OnRequest),
             Some(workspace_write_policy(vec!["/repo", "/tmp"], false)),
-            None,
+            fake_shell(),
         );
 
         let expected = r#"<environment_context>
@@ -170,6 +231,7 @@ mod tests {
     <root>/repo</root>
     <root>/tmp</root>
   </writable_roots>
+  <shell>bash</shell>
 </environment_context>"#;
 
         assert_eq!(context.serialize_to_xml(), expected);
@@ -181,13 +243,14 @@ mod tests {
             None,
             Some(AskForApproval::Never),
             Some(SandboxPolicy::ReadOnly),
-            None,
+            fake_shell(),
         );
 
         let expected = r#"<environment_context>
   <approval_policy>never</approval_policy>
   <sandbox_mode>read-only</sandbox_mode>
   <network_access>restricted</network_access>
+  <shell>bash</shell>
 </environment_context>"#;
 
         assert_eq!(context.serialize_to_xml(), expected);
@@ -199,15 +262,94 @@ mod tests {
             None,
             Some(AskForApproval::OnFailure),
             Some(SandboxPolicy::DangerFullAccess),
-            None,
+            fake_shell(),
         );
 
         let expected = r#"<environment_context>
   <approval_policy>on-failure</approval_policy>
   <sandbox_mode>danger-full-access</sandbox_mode>
   <network_access>enabled</network_access>
+  <shell>bash</shell>
 </environment_context>"#;
 
         assert_eq!(context.serialize_to_xml(), expected);
+    }
+
+    #[test]
+    fn equals_except_shell_compares_approval_policy() {
+        // Approval policy
+        let context1 = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(AskForApproval::OnRequest),
+            Some(workspace_write_policy(vec!["/repo"], false)),
+            fake_shell(),
+        );
+        let context2 = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(AskForApproval::Never),
+            Some(workspace_write_policy(vec!["/repo"], true)),
+            fake_shell(),
+        );
+        assert!(!context1.equals_except_shell(&context2));
+    }
+
+    #[test]
+    fn equals_except_shell_compares_sandbox_policy() {
+        let context1 = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(AskForApproval::OnRequest),
+            Some(SandboxPolicy::new_read_only_policy()),
+            fake_shell(),
+        );
+        let context2 = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(AskForApproval::OnRequest),
+            Some(SandboxPolicy::new_workspace_write_policy()),
+            fake_shell(),
+        );
+
+        assert!(!context1.equals_except_shell(&context2));
+    }
+
+    #[test]
+    fn equals_except_shell_compares_workspace_write_policy() {
+        let context1 = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(AskForApproval::OnRequest),
+            Some(workspace_write_policy(vec!["/repo", "/tmp", "/var"], false)),
+            fake_shell(),
+        );
+        let context2 = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(AskForApproval::OnRequest),
+            Some(workspace_write_policy(vec!["/repo", "/tmp"], true)),
+            fake_shell(),
+        );
+
+        assert!(!context1.equals_except_shell(&context2));
+    }
+
+    #[test]
+    fn equals_except_shell_ignores_shell() {
+        let context1 = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(AskForApproval::OnRequest),
+            Some(workspace_write_policy(vec!["/repo"], false)),
+            Shell {
+                shell_type: ShellType::Bash,
+                shell_path: "/bin/bash".into(),
+            },
+        );
+        let context2 = EnvironmentContext::new(
+            Some(PathBuf::from("/repo")),
+            Some(AskForApproval::OnRequest),
+            Some(workspace_write_policy(vec!["/repo"], false)),
+            Shell {
+                shell_type: ShellType::Zsh,
+                shell_path: "/bin/zsh".into(),
+            },
+        );
+
+        assert!(context1.equals_except_shell(&context2));
     }
 }
